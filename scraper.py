@@ -11,8 +11,9 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import Select
 from selenium.webdriver.common.by import By
 from dataclasses import dataclass
+from time import perf_counter
 
-logging.basicConfig(filename="logfile.log", level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(filename="scraper.log", level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 
 # @dataclass
 # class SearchSettings:
@@ -23,28 +24,74 @@ search_results_to_analyze = "https://www.linkedin.com/jobs/search/?keywords=Qa&l
 # search_results_to_analyze = 'https://www.linkedin.com/jobs/search/?keywords=Qa&location=Canada&locationId=&geoId=101174742&f_TPR=&f_PP=101788145&f_E=1%2C2%2C3%2C4&f_JT=P&position=1&pageNum=0'
 # search_results_to_analyze = "https://www.linkedin.com/jobs/search?keywords=Developer&location=Canada&locationId=&geoId=101174742&f_TPR=&f_E=3&position=1&pageNum=0"
 def get_jobs_from_search(URL):
-    jobList = []
+    st = perf_counter()
     if "linkedin" in URL:
         urls = []
         urls = get_search_results_linkedin(URL)
-        # with open('08-05-2023 22:09:24 keywords=Developer&location=Canada&locationId=&geoId=101174742&f_TPR=&f_E=3&position=1&pageNum=0.jobfile', "r") as file:
-        #     for item in file:
-        #         urls.append(item)
-                
-        writable_url = re.sub(r'.*?search/\?','',URL)
-        label = f'URL_LIST - {datetime.now().strftime("%H:%M:%S %d-%m-%Y")} {writable_url}.jobfile'
+        #Check that the search results have been generated properly
+        if urls == None:
+            logging.error('Unable to access linkedin search results. Likely a connection issue.')
+            return
+        #create a filename
+        writable_url = re.sub(r'.*?search/?\?','',URL)
+        filename = f'URL_LIST - {datetime.now().strftime("%H:%M:%S %d-%m-%Y")} {writable_url}.jobfile'
         #write down urls in case they need to be reviewed later
-        with open(label, "w") as file:
+        with open(filename, "w") as file:
             for item in urls:
                 file.write(f"{item}\n")
-        #download all the URL pages into job objects which are nice and clean, store in file as we go
-        with open(label[11:], "a") as file:
-            for url in urls:
-                print(f'downloading job from {url}')
-                jobResult = job.get_linkedin(url)
-                jobResult.search_origin = URL
-                jobList.append(jobResult)
-                file.write(jobResult.dump())
+        #write down time that this scrape took
+        with open('process_times.log', "a") as file:
+            file.write(f'{len(urls)} URLs took {perf_counter() - st} to scrape.')
+                    
+        #download all the URL pages into job objects which are nice and clean, store in a file as we go
+        asyncio.run(download_jobs(urls, filename[11:], URL))
+        
+        #write down total time for this operation to complete
+        with open('process_times.log', "a") as file:
+            file.write(f'{len(urls)} jobs took {perf_counter() - st} to download.')
+            
+async def download_jobs(urls: list, filename: str, query: str):
+    """Creates a web session and uses asynchronous functions to download requested urls.
+    """
+    #use fake header because we arent a bot
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:100.0) Gecko/20100101 Firefox/100.0"}
+    #download all urls into a list of jobs asynchronously
+    async with aiohttp.ClientSession(headers=headers) as session:
+        jobList = await asyncio.gather(*[job.get_linkedin(url, session) for url in urls])
+    
+    finalList = jobList
+    spam_check = set()
+    
+    #write jobs to a file
+    with open(filename, "a") as file:
+        for i,item in enumerate(jobList):            
+            #check that it was downloaded cworrectly
+            if item.title == '.':
+                # logging.error(f'Was not able to download {urls[i]}')
+                print(f'Empty job: {item.dump()}')
+                del finalList[i]
+                continue
+            #check for spam and filter out jobs with the same posting title and company name, O(n) time
+            id = item.title+item.company_name
+            if id in spam_check:
+                # print(f'{id} is spam')
+                # print(f'this is whats in the spam: {item.title}')
+                del finalList[i]
+                continue
+            else:
+                spam_check.add(id)
+            
+            #add the search origin to the job
+            item.search_origin = query
+            serialized_item = item.dump()
+            #check that it was serialized correctly
+            if serialized_item == None:
+                logging.error(f'Could not correctly serialize {urls[i]}')
+                print(f'Could not correctly serialize {urls[i]}')
+            else:
+                file.write(serialized_item)
+    print(f'completed {filename}')
+    return finalList
                     
             
         
@@ -57,7 +104,11 @@ def get_search_results_linkedin(URL: str):
     opt.binary_location = "/usr/bin/google-chrome-stable"
     opt.add_argument("--incognito")
     driver = webdriver.Chrome(options=opt)
-    driver.get(URL)
+    #attempt connection
+    try:
+        driver.get(URL)
+    except Exception:
+        logging.error('Selenium could not connect')
     #we will use the button to determine when all results are loaded.
     #it only appears after a few pages, and disappears when the list is fully loaded
     #it will be set to false if all results are loaded before it appears
@@ -76,10 +127,8 @@ def get_search_results_linkedin(URL: str):
     #scroll down until page transitions to button-based scrolling
     while button == None:
         try:
-            print("looking for scroll button")
             button = driver.find_element(By.CLASS_NAME, "infinite-scroller__show-more-button--visible")
-        except:
-            print("found no scroll button")
+        except Exception:
             #scroll to bottom
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
             time.sleep(0.5)
@@ -90,12 +139,16 @@ def get_search_results_linkedin(URL: str):
     while button:  
         try:
             button.click()
-        except:
+        except Exception:
             break
     print("done scrolling")
     #scape all job links from page
     cards = driver.find_elements(By.CLASS_NAME, "base-card__full-link")
+    #report if there are missing results
     print(f'{len(cards)} found of {jobs_amount} total')
+    if not (len(cards) == jobs_amount):
+        logging.error(f'{len(cards)} found of {jobs_amount} total. May have disconnected while searching.')
+        
     for item in cards:
             urls.append(item.get_attribute('href'))
     return urls
@@ -107,113 +160,14 @@ def buttonless_check_for_more_results_linkedin(driver: webdriver):
     #if the signal object can't be found there is a major issue and we will crash
     try: 
         signal = driver.find_element(By.CLASS_NAME, "inline-notification__text")
-    except:
+    except Exception:
         print("***\nerror loading finish signal\n***")
+        logging.error('error loading finish signal on initial search')
     else:
-        print("loaded finish signal")
         if signal.is_displayed():
             print('finish signal active')
             return False
         else:
             return None
 
-# def check_for_end_of_results_linkedin(driver: webdriver, amount: int):
-#     cards = driver.find_elements(By.CLASS_NAME, "base-card__full-link")
-#     if len(cards) >= (amount-2):
-#         print('all results downloaded')
-#         print(f'{len(cards)} found of {amount-2} total')
-#         return cards
-#     print(f'{len(cards)} found of {amount-2} total, continuing...')
-#     return None
-
-
 get_jobs_from_search(search_results_to_analyze)
-
-
-
-
-# def generate_URL_batch(settings: dict):
-#     """Creates a URL list for the dates given at a select location.
-    
-#     Parameters
-#     -
-#     settings: The location and period of time you would like to search"""
-#     date = datetime(settings['firstYear'], settings['firstMonth'], settings['firstDay'])
-#     endDate = datetime(settings['lastYear'], settings['lastMonth'], settings['lastDay'])
-#     total = (endDate - date)+ timedelta(days=1) 
-#     url = ['']*total.days
-#     testListt = ["https://python.org", "https://python.org", "https://python.org"]
-#     for i in range(total.days):
-#         #subNumber has a -1 due to the offset of lists
-#         url[i] = (f"https://www.apahotel.com/monthly_search/?book-plan-category=11&book-no-night=30&prefsub={prefList[settings['subNumber']-1]}"
-#         f"&areasub={idList[settings['subNumber']-1]}&book-checkin={date}&book-no-people={settings['numberPeople']}&book-no-room={settings['numberRooms']}&book-no-children1"
-#         f"=&book-no-children2=&book-no-children3=&book-no-children4=&book-no-children5=&book-no-children6=&book-smoking={settings['smokingRoom']}&is_midnight=0")
-#         date += timedelta(days=1)
-#         with open(f'generatorlog.log', 'a') as f:
-#                 f.write(f'{url[i]}\n\n')
-#                 print(f'{url[i]}\n')
-#     return url
-
-# def SEARCH_EVERYTHING(settings: dict):
-#     """Creates a URL list of all valid dates at all locations
-    
-#     Parameters
-#     -
-#     settings: Most settings will be overwritten by this function"""
-#     settings["lastDay"] = 31
-#     settings["lastMonth"] = 10
-#     settings["lastYear"] = 2023
-#     settings["firstDay"] = int(datetime.now().strftime("%d"))
-#     settings["firstMonth"] = int(datetime.now().strftime("%m"))
-#     settings["firstYear"] = int(datetime.now().strftime("%Y"))
-#     urlList = generate_URL_batch(settings)
-#     for i in range(len(idList)):
-#         #subs start at one, not zero
-#         settings["subNumber"] = i + 1
-#         urlList = urlList + generate_URL_batch(settings)
-#     return urlList
-        
-
-# async def get_and_check_HTML(session: aiohttp.ClientSession, url: str):
-#     """Requests html from one url and waits. When the page arrives it is checked for vacancy
-#     and if found, creates a file in the current directory containing its link
-    
-#     Parameters
-#     -
-#     session: the aiohttp session that is being used to send web requests.
-#     url: website url that needs to be checked.
-#     """
-#     async with session.get(url) as response:
-#         dump = await response.text()
-#         logging.info(f"searched: {url}")
-#         #when HTML is received, search it for availabilities and log the result
-#         bookings = re.search((r'<span class="big-font">[^0]</span>'), dump)
-#         if (bookings != None):
-#             bookings = re.search(r'\d+', bookings.group())
-#             print("FOUND ONE ON THIS DAY, NUMBER AVAIL: ", bookings.group())
-#             logging.warning("match found")
-#             #write the url with bookings to hard drive
-#             with open(f'targetpage__{datetime.now()}.html', 'w') as f:
-#                 f.write(url)
-         
-# async def main(mode: int):
-#     """Creates a web session and uses asynchronous functions to download requested urls.
-    
-#     Parameters
-#     -
-#     mode: toggles the scope of the search.
-    
-#     0 - Search a single location, 1 - Search all locations during all dates
-#     """
-#     #use fake header because we arent a bot
-#     async with aiohttp.ClientSession(headers=headers) as session:
-#         #option for searching a single location or all of them
-#         if mode == 0:
-#             queryType = generate_URL_batch(querySettings)
-#         if mode == 1:
-#             queryType = SEARCH_EVERYTHING(querySettings)
-#         await asyncio.gather(*[get_and_check_HTML(session, url) for url in queryType])
-            
-# # if __name__ == "__main__":
-# #     idList, prefList, subList, engList = generate_location_lists()
-# #     asyncio.run(main(1))
